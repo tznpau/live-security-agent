@@ -1,0 +1,14 @@
+.env
+
+.venv/
+
+models/*.joblib
+
+
+__pycache__/
+*.pyc
+
+*.npy
+*.png
+
+.DS_Store

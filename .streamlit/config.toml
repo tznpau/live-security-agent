@@ -1,0 +1,27 @@
+[theme]
+base = "dark"
+
+primaryColor = "#ff2e88"            # buttons, sliders, active widgets — hot magenta
+backgroundColor = "#100a1f"         # near-black deep purple, not pure black
+secondaryBackgroundColor = "#1d1135"# widget bg, slightly lighter purple
+textColor = "#f4ecd8"               # warm cream, high contrast on dark bg
+
+linkColor = "#00e5ff"               # cyan — markdown links stand out
+codeTextColor = "#ffd23f"           # amber — classic terminal code color
+codeBackgroundColor = "#1a0f2e"     # darker than secondaryBackgroundColor, so code blocks read as their own "panel"
+borderColor = "#5c3d99"             # muted violet outline for widgets
+
+font = "monospace"                  # body text now monospace too — full terminal feel
+headingFont = "monospace"
+codeFont = "monospace"
+baseFontSize = 15                   
+
+baseRadius = "none"                 # sharp corners, no rounded-modern-app look
+buttonRadius = "none"
+showWidgetBorder = true             # visible boxes around inputs — like old terminal form fields
+
+[theme.sidebar]
+backgroundColor = "#0a0617"         # darker than main bg, for layered depth
+secondaryBackgroundColor = "#1d1135"
+textColor = "#00e5ff"               # cyan sidebar text differentiates it from main-body cream
+borderColor = "#ff2e88"             # magenta edge clearly separates sidebar from content

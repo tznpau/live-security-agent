@@ -141,8 +141,13 @@ PI_HOST = "pifive"
 PI_USER = "piadmin"
 PI_LOG_PATH = "/home/piadmin/zeek-logs/live/conn.log"
 
-LIVE_CAPTURE_DURATION = 25
-LIVE_CAPTURE_FLOW_CAP = 30
+# A line that can never be a real Zeek flow (those start with a unix timestamp).
+# tail_worker pushes this onto the queue if the SSH connection fails, so the
+# main thread can show the real cause instead of waiting out the whole window.
+CAPTURE_ERROR_SENTINEL = "__CAPTURE_ERROR__:"
+
+LIVE_CAPTURE_DURATION = 15
+LIVE_CAPTURE_FLOW_CAP = 20
 
 RAW_CONN_FIELDS = [
     'ts', 'uid', 'id.orig_h', 'id.orig_p', 'id.resp_h', 'id.resp_p',
@@ -171,17 +176,29 @@ def build_log_content(lines: list) -> str:
     body = [l for l in lines if l.strip() and not l.startswith('#')]
     return LIVE_LOG_HEADER + "\n".join(body)
 
+# Caches the feature matrix and autoencoder intermediates from the most
+# recent classify_traffic call, so explain_connection can look up a
+# specific row by index without the agent needing to resend the entire
+# log as input 
+LAST_ANALYSIS = {"X": None, "X_scaled": None, "X_reconstructed": None}
+
 
 def tail_worker(out_queue: queue.Queue, stop_event: threading.Event, password: str):
     """Background thread — SSH only. No Streamlit calls allowed in here;
     it only feeds raw lines into out_queue."""
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=PI_HOST, username=PI_USER, password=password,
-        look_for_keys=False, allow_agent=False,
-    )
-    _, stdout, _ = client.exec_command(f"tail -F {PI_LOG_PATH}", get_pty=False)
+    try:
+        client.connect(
+            hostname=PI_HOST, username=PI_USER, password=password,
+            look_for_keys=False, allow_agent=False,
+            timeout=5,
+        )
+        _, stdout, _ = client.exec_command(f"tail -F {PI_LOG_PATH}", get_pty=False)
+    except Exception as e:
+        out_queue.put(f"{CAPTURE_ERROR_SENTINEL}{e}")
+        client.close()
+        return
     channel = stdout.channel
     channel.settimeout(1.0)
 
@@ -201,29 +218,34 @@ def tail_worker(out_queue: queue.Queue, stop_event: threading.Event, password: s
     client.close()
 
 
-def run_live_capture(password: str, line_placeholder) -> list:
+def run_live_capture(password: str, line_placeholder) -> tuple:
     """Main thread: starts the SSH tail in the background, then drains
     the queue HERE for LIVE_CAPTURE_DURATION seconds or until
     LIVE_CAPTURE_FLOW_CAP lines arrive — whichever comes first. Updates
-    line_placeholder (an st.empty()) live as each line lands."""
+    line_placeholder (an st.empty()) live as each line lands.
+    Returns (collected_lines, error_string_or_None)."""
     q = queue.Queue()
     stop_event = threading.Event()
     thread = threading.Thread(target=tail_worker, args=(q, stop_event, password), daemon=True)
     thread.start()
 
     collected = []
+    error = None
     start = time.time()
     while time.time() - start < LIVE_CAPTURE_DURATION and len(collected) < LIVE_CAPTURE_FLOW_CAP:
         try:
             line = q.get(timeout=0.5)
-            collected.append(line)
-            line_placeholder.code("\n".join(collected))
         except queue.Empty:
             continue
+        if line.startswith(CAPTURE_ERROR_SENTINEL):
+            error = line[len(CAPTURE_ERROR_SENTINEL):]
+            break
+        collected.append(line)
+        line_placeholder.code("\n".join(collected))
 
     stop_event.set()
     thread.join(timeout=2)
-    return collected
+    return collected, error
 
 
 def load_conn_log(content: str) -> pd.DataFrame:
@@ -329,6 +351,28 @@ TOOL_DEFINITIONS = [
             },
             "required": ["log_content"]
         }
+    },
+    {
+        "name": "explain_connection",
+        "description": (
+            "Explain why one specific connection received its prediction. "
+            "Returns that connection's actual feature values, each "
+            "supervised model's global feature-importance ranking, and the "
+            "autoencoder's per-feature reconstruction error for that exact "
+            "connection. Only call this AFTER classify_traffic has already "
+            "been run on the current log — it looks up a connection by its "
+            "index in that result, it does not take new log content."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "connection_index": {
+                    "type": "integer",
+                    "description": "Zero-based index of the connection to explain (e.g. the outlier_index or an index from error_sample in classify_traffic's results)."
+                }
+            },
+            "required": ["connection_index"]
+        }
     }
 ]
 
@@ -357,6 +401,7 @@ def run_classify_traffic(log_content: str, status_callback=None) -> dict:
     n_connections = len(X)
     if n_connections == 0:
         return {"error": "No connections found in log file."}
+    LAST_ANALYSIS["X"] = X 
 
     results = {"n_connections": n_connections, "models": {}}
 
@@ -428,6 +473,8 @@ def run_classify_traffic(log_content: str, status_callback=None) -> dict:
         try:
             X_scaled = MODELS["ae_scaler"].transform(X)
             X_reconstructed = MODELS["autoencoder"].predict(X_scaled)
+            LAST_ANALYSIS["X_scaled"] = X_scaled
+            LAST_ANALYSIS["X_reconstructed"] = X_reconstructed
             # Mean squared error per connection across all 13 features
             reconstruction_errors = np.mean((X_scaled - X_reconstructed) ** 2, axis=1)
             # Sample errors: first 10, last 5, and the max outlier index
@@ -454,6 +501,93 @@ def run_classify_traffic(log_content: str, status_callback=None) -> dict:
     return results
 
 
+def explain_connection(connection_index: int) -> dict:
+    """
+    Explains one connection's prediction. Returns three things, and they are
+    NOT all the same kind of evidence — this matters:
+
+    - feature_values: this connection's actual numbers.
+    - random_forest_top_global_features / xgboost_top_global_features:
+      what each model relies on most OVERALL, across all training data.
+      This is a GLOBAL property of the model, not a per-instance
+      explanation — sklearn/XGBoost's feature_importances_ doesn't tell you
+      "why did the model flag THIS row," only "what does this model
+      generally pay attention to." We hand the agent both this and the
+      actual values so it can connect them itself, but it's important the
+      agent (and you, in the write-up) doesn't conflate the two.
+    - autoencoder_top_contributing_features: the per-feature squared
+      reconstruction error for THIS specific row. This one genuinely is
+      instance-level — it's not "what the model generally cares about,"
+      it's "which of these 13 numbers, for this exact connection, looked
+      least like anything the model saw during training."
+    """
+    X = LAST_ANALYSIS["X"]
+    if X is None:
+        return {"error": "No traffic has been classified yet. Call classify_traffic first."}
+
+    if connection_index is None or connection_index < 0 or connection_index >= len(X):
+        return {"error": f"connection_index out of range. Valid range: 0-{len(X)-1}."}
+
+    row = X.iloc[connection_index]
+    result = {
+        "connection_index": connection_index,
+        # .item() converts numpy float64/int64 to plain Python types —
+        # json.dumps chokes on numpy scalars otherwise.
+        "feature_values": {k: (v.item() if hasattr(v, "item") else v) for k, v in row.to_dict().items()},
+    }
+
+    if MODELS["random_forest"] is not None:
+        importances = dict(zip(FEATURE_COLUMNS, MODELS["random_forest"].feature_importances_))
+        top = sorted(importances.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        result["random_forest_prediction"] = int(MODELS["random_forest"].predict(X.iloc[[connection_index]])[0])
+        result["random_forest_top_global_features"] = [
+            {"feature": f, "importance": round(float(v), 4)} for f, v in top
+        ]
+
+    if MODELS["xgboost"] is not None:
+        importances = dict(zip(FEATURE_COLUMNS, MODELS["xgboost"].feature_importances_))
+        top = sorted(importances.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        result["xgboost_prediction"] = int(MODELS["xgboost"].predict(X.iloc[[connection_index]])[0])
+        result["xgboost_top_global_features"] = [
+            {"feature": f, "importance": round(float(v), 4)} for f, v in top
+        ]
+
+    X_scaled = LAST_ANALYSIS["X_scaled"]
+    X_reconstructed = LAST_ANALYSIS["X_reconstructed"]
+    if X_scaled is not None and X_reconstructed is not None:
+        per_feature_error = (X_scaled[connection_index] - X_reconstructed[connection_index]) ** 2
+        paired = sorted(zip(FEATURE_COLUMNS, per_feature_error), key=lambda kv: kv[1], reverse=True)
+        result["autoencoder_top_contributing_features"] = [
+            {"feature": f, "squared_error": round(float(v), 4)} for f, v in paired[:3]
+        ]
+
+    return result
+
+
+def build_verdict_chart_df(raw_results: dict) -> pd.DataFrame:
+    """
+    One-column DataFrame of 'connections flagged as suspicious' per model,
+    for st.bar_chart. This is the visual of the central finding: the two
+    supervised models disagree (one flags many, the other few) while both
+    anomaly detectors flag everything. Computed only from numbers already in
+    raw_results — no model re-runs, no LLM call, so it adds no agent time.
+    """
+    models = raw_results.get("models", {})
+    flagged = {}
+    rf  = models.get("random_forest", {})
+    xgb = models.get("xgboost", {})
+    iso = models.get("isolation_forest", {})
+    ae  = models.get("autoencoder", {})
+    if "malicious_count" in rf:  flagged["Random Forest"]    = rf["malicious_count"]
+    if "malicious_count" in xgb: flagged["XGBoost"]          = xgb["malicious_count"]
+    if "anomaly_count" in iso:   flagged["Isolation Forest"] = iso["anomaly_count"]
+    if "anomaly_count" in ae:    flagged["Autoencoder"]      = ae["anomaly_count"]
+    return pd.DataFrame(
+        {"Flagged as suspicious": list(flagged.values())},
+        index=list(flagged.keys()),
+    )
+
+
 # will grow as more tools are developed
 # TO DO: explain_connection tool that takes 1 row and explain which features drove the prediction
 def execute_tool(tool_name: str, tool_input: dict, status_callback=None) -> str:
@@ -467,6 +601,10 @@ def execute_tool(tool_name: str, tool_input: dict, status_callback=None) -> str:
     """
     if tool_name == "classify_traffic":
         result = run_classify_traffic(tool_input.get("log_content", ""), status_callback=status_callback)
+    elif tool_name == "explain_connection":
+        if status_callback:
+            status_callback("Explaining connection...")
+        result = explain_connection(tool_input.get("connection_index"))
     else:
         result = {"error": f"Unknown tool: {tool_name}"}
 
@@ -483,37 +621,33 @@ def execute_tool(tool_name: str, tool_input: dict, status_callback=None) -> str:
 # so by the time this line runs, the key is in os.environ.
 client = anthropic.Anthropic()
 
-SYSTEM_PROMPT = """You are a tier-2 network security analyst reviewing IoT network flow data. You have access to four ML-based detection tools trained on IoT network traffic. Your job is to run these tools, interpret their outputs, and produce a clear, evidence-grounded assessment.
+SYSTEM_PROMPT = """You are a tier-2 SOC analyst reviewing IoT network flow data. Run the detection tools, interpret their output, and produce a short, evidence-grounded assessment.
 
-TOOLS AVAILABLE:
-- Random Forest: a supervised classifier that outputs a binary label (Benign/Malicious) and a confidence probability for each connection.
-- XGBoost: a second supervised classifier with the same interface. Use it to corroborate or challenge Random Forest findings.
-- Isolation Forest: an unsupervised anomaly detector trained on normal traffic only. It returns an anomaly score — more negative means more anomalous. It has no knowledge of what attacks look like; it only knows what normal looks like.
-- Autoencoder: a reconstruction-based anomaly detector, also trained on normal traffic only. It returns a reconstruction error per connection. The threshold for normal is 0.077. Connections above this threshold could not be reconstructed from patterns the model has seen.
+DETECTORS (all run together by classify_traffic):
+- Random Forest & XGBoost — supervised classifiers; each outputs Benign/Malicious + a confidence. Treat them as two independent opinions.
+- Isolation Forest & Autoencoder — unsupervised, trained on normal traffic only. They judge FAMILIARITY, not attack type. Autoencoder's normal threshold is 0.077; higher reconstruction error = the further the flow deviates from normal IoT traffic.
 
-HOW TO INTERPRET DISAGREEMENT:
-If supervised models disagree with each other, do not average or dismiss — investigate. Disagreement between classifiers is itself a signal worth explaining.
-If supervised models disagree with anomaly detectors, explain the structural difference: supervised models make claims about attack type, anomaly detectors make claims about familiarity. Both can be simultaneously correct.
+Extra tool:
+- explain_connection — given a connection index, returns that connection's feature values, each supervised model's GLOBAL feature importances, and the autoencoder's PER-CONNECTION reconstruction error.
 
-USE OF YOUR THINKING PHASE:
-After the classify_traffic tool returns its results, use your thinking phase to genuinely work through the numbers before composing your final answer. Specifically:
-- Walk through what each model actually reported, in your own words, as if you were puzzling it out for the first time.
-- When two models disagree, reason about *why* — what about their design (supervised vs. unsupervised, classification vs. reconstruction) would make them diverge on this particular traffic.
-- Consider at least one alternative interpretation of the evidence before settling on your assessment, and say why you ruled it in or out.
-- Only move to your final answer once you've reasoned through the disagreement, not before.
-Do not simply restate that you are about to call a tool or that results have arrived — that is not reasoning, it's narration. The thinking phase is where the real interpretive work happens; the final answer is where you report the conclusion of that work.
+INTERPRETING DISAGREEMENT:
+- Supervised vs supervised: don't average or dismiss — the disagreement is itself the signal. Explain what each model is keying on.
+- Supervised vs anomaly: not a contradiction. Supervised claims attack type; anomaly claims unfamiliarity. Both can be true at once.
 
-OUTPUT REQUIREMENTS:
-1. Summarise what each model found, using the exact numbers from the tool output.
-2. Identify whether the models agree or disagree, and what the disagreement pattern suggests.
-3. Interpret anomaly scores and reconstruction error magnitudes — not just whether they exceed a threshold, but by how much and what that implies.
-4. State your overall assessment of the traffic: likely benign, likely malicious, ambiguous, or requires further investigation.
-5. If you recommend action, specify what kind (monitor, isolate, escalate) and what evidence supports it.
+THINK BEFORE ANSWERING: in your thinking phase, work through what each model reported, reason about WHY any disagreement follows from model design, and rule out at least one alternative reading before settling. Reasoning, not narration — don't announce tool calls.
 
-Be technically precise. Do not speculate beyond the data. If the evidence is ambiguous, say so explicitly."""
+OUTPUT — write for a SOC analyst under time pressure: verdict first, skimmable in under 1 minute. Exactly these four sections, every time:
+1. **Verdict** — severity emoji + one of [Likely Benign / Likely Malicious / Ambiguous / Requires Investigation] + one or two sentences on what the traffic most likely IS.
+2. **Why** — 4-6 short bullets, one piece of evidence each. Say whether the models agree; if the supervised models split, give the structural reason in one sentence. Don't walk through every connection. Describe anomalies as deviations from normal/baseline traffic behaviour — never as distance from the models' training data or what a model has "seen".
+3. **Key connection** — the autoencoder's worst outlier, and only that one. If its per-connection detail wasn't already provided to you, call explain_connection on it first. In 2-3 sentences, say what about ITS feature values stands out. Note: RF/XGBoost feature importances are GLOBAL (what the model relies on across all training, not why THIS row was flagged) — only the autoencoder's per-feature error is instance-level. Don't conflate the two.
+4. **Actions** — one markdown table, max 5 rows, columns Action | Why; prefix each Action with a severity emoji.
+
+Severity: 🔴 isolate/escalate now · 🟡 investigate · 🟢 no action.
+One table only (the Actions table). State ambiguity in the Verdict, don't hedge throughout. Be precise; don't speculate beyond the data."""
 
 
 def run_agent(user_message: str, history: list, uploaded_log: str = None,
+              precomputed_results: dict = None, precomputed_explanation: dict = None,
               status_callback=None) -> tuple:
     """
     The agent loop. Sends the user message to Claude, handles any tool calls
@@ -524,6 +658,12 @@ def run_agent(user_message: str, history: list, uploaded_log: str = None,
         user_message    : the text the user typed in the chat input
         history          : the conversation so far as a list of Anthropic message dicts
         uploaded_log     : the full text of an uploaded conn.log, or None
+        precomputed_results : classify_traffic results already computed in
+                              Python (Live Watch path). When provided, the
+                              agent is handed the numbers directly and given
+                              no tools, guaranteeing a single turn instead of
+                              calling classify_traffic again on data it
+                              already has the answer to.
         status_callback  : optional function(str) -> None. If provided, it is
                             called with a short status string right before each
                             tool call, so the caller (e.g. Streamlit) can show
@@ -542,18 +682,41 @@ def run_agent(user_message: str, history: list, uploaded_log: str = None,
                           conversation, ready to be stored in session_state.
     """
 
-    # If a log file was uploaded, append it to the user message so the agent
-    # knows it exists and can pass it to the classify_traffic tool.
-    # We don't pass it automatically — the LLM decides whether to call the tool.
-    if uploaded_log:
+    if precomputed_results is not None:
+        explanation_block = ""
+        if precomputed_explanation is not None:
+            explanation_block = (
+                f"\n\nexplain_connection has already been run on the worst outlier "
+                f"(connection {precomputed_explanation.get('connection_index')}). Result:\n\n"
+                f"<explanation>\n{json.dumps(precomputed_explanation)}\n</explanation>\n\n"
+                f"Use these numbers directly. Do NOT call explain_connection again — "
+                f"build your report around this single connection as the worked example. "
+                f"Analysing further connections individually is unnecessary and slows the response."
+            )
+        full_message = (
+            f"{user_message}\n\n"
+            f"classify_traffic has already been run on this capture. Here are its results:\n\n"
+            f"<results>\n{json.dumps(precomputed_results)}\n</results>"
+            f"{explanation_block}\n\n"
+            f"Interpret these results directly in your final answer."
+        )
+        # The worst outlier is already explained in-message, so the agent has everything
+        # it needs — hand it no tools, forcing a single-turn answer (no extra round trip,
+        # consistent timing). Only fall back to leaving explain_connection available if,
+        # in some degraded run, we have no precomputed explanation to give it.
+        active_tools = [] if precomputed_explanation is not None \
+            else [t for t in TOOL_DEFINITIONS if t["name"] != "classify_traffic"]
+    elif uploaded_log:
         full_message = (
             f"{user_message}\n\n"
             f"[A Zeek conn.log has been uploaded. "
             f"Call the classify_traffic tool with the following content to analyse it.]\n\n"
             f"<log_content>\n{uploaded_log}\n</log_content>"
         )
+        active_tools = TOOL_DEFINITIONS
     else:
         full_message = user_message
+        active_tools = TOOL_DEFINITIONS
 
     # Add the user turn to history
     history = history + [{"role": "user", "content": full_message}]
@@ -581,10 +744,10 @@ def run_agent(user_message: str, history: list, uploaded_log: str = None,
             max_tokens=16384,
             thinking={
                 "type": "enabled",
-                "budget_tokens": 6000
+                "budget_tokens": 2000
             },
             system=SYSTEM_PROMPT,
-            tools=TOOL_DEFINITIONS,
+            tools=active_tools,
             messages=history
         )
 
@@ -756,10 +919,6 @@ def main():
                 # above the final answer. expanded=True so it's visible by
                 # default during the live demo — change to False for normal use
                 # if it gets in the way of quick back-and-forth chatting.
-                if thinking_text:
-                    with st.expander("Agent reasoning", expanded=True):
-                        st.markdown(thinking_text)
-
                 st.markdown(response_text)
 
             # save to session state
@@ -781,35 +940,71 @@ def main():
         if start_clicked:
             line_placeholder = st.empty()
             with st.spinner("Listening..."):
-                captured_lines = run_live_capture(pi_password, line_placeholder)
+                captured_lines, capture_error = run_live_capture(pi_password, line_placeholder)
 
-            if len(captured_lines) == 0:
+            if capture_error:
+                st.error(f"Could not connect to the Pi: {capture_error}")
+            elif len(captured_lines) == 0:
                 st.warning("No flows captured — check Zeek is running on the Pi.")
             else:
                 st.success(f"Captured {len(captured_lines)} flows.")
                 log_content = build_log_content(captured_lines)
 
-                st.subheader("Raw model outputs")
+                # Run the models first (raw_results must exist before any visual uses it)...
                 with st.spinner("Running models..."):
                     raw_results = run_classify_traffic(log_content)
+
+                st.subheader("Raw model outputs")
                 st.json(raw_results)
+
+                chart_df = build_verdict_chart_df(raw_results)
+                n = raw_results["n_connections"]
+
+                # Build metrics from chart_df so their order matches the chart exactly.
+                cols = st.columns(len(chart_df))
+                for col, (model_name, row) in zip(cols, chart_df.iterrows()):
+                    col.metric(model_name, f"{int(row['Flagged as suspicious'])}/{n} flagged")
+
+                if not chart_df.empty:
+                    import altair as alt
+                    st.subheader("Model agreement at a glance")
+                    n_total = raw_results.get("n_connections", int(chart_df["Flagged as suspicious"].max()))
+                    plot_df = chart_df.reset_index().rename(columns={"index": "Model"})
+                    chart = (
+                        alt.Chart(plot_df)
+                        .mark_bar()
+                        .encode(
+                            x=alt.X("Model:N", sort=None, axis=alt.Axis(labelAngle=0)),
+                            y=alt.Y("Flagged as suspicious:Q",
+                                    scale=alt.Scale(domain=[0, n_total]),
+                                    title=f"Flagged (of {n_total})"),
+                            tooltip=["Model", "Flagged as suspicious"],
+                        )
+                        .properties(height=300)
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+                    st.caption("Connections each model flagged as suspicious — uneven bars mean the models disagree.")
 
                 st.subheader("Agent interpretation")
                 status_placeholder = st.empty()
                 def update_status(msg):
                     status_placeholder.info(msg)
 
+                update_status("Examining anomalies...")
+                outlier_idx = raw_results.get("models", {}).get("autoencoder", {}).get("outlier_index")
+                precomputed_explanation = explain_connection(outlier_idx) if outlier_idx is not None else None
+
+                update_status("Reasoning over the model outputs and writing the report...")
+
                 response_text, thinking_text, _ = run_agent(
                     "A live traffic capture has just completed. Analyse it.",
                     [],
-                    uploaded_log=log_content,
+                    precomputed_results=raw_results,
+                    precomputed_explanation=precomputed_explanation,
                     status_callback=update_status,
                 )
                 status_placeholder.empty()
 
-                if thinking_text:
-                    with st.expander("Agent reasoning", expanded=True):
-                        st.markdown(thinking_text)
                 st.markdown(response_text)
 
 

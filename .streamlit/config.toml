@@ -14,7 +14,7 @@ borderColor = "#5c3d99"             # muted violet outline for widgets
 font = "monospace"                  # body text now monospace too — full terminal feel
 headingFont = "monospace"
 codeFont = "monospace"
-baseFontSize = 15                   
+baseFontSize = 14                   
 
 baseRadius = "none"                 # sharp corners, no rounded-modern-app look
 buttonRadius = "none"
